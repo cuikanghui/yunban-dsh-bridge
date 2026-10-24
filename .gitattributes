@@ -1,0 +1,18 @@
+# 统一换行符，避免 Windows/Linux 用户拿到不同结果
+* text=auto
+
+# PowerShell / 批处理必须是 CRLF，否则某些环境下会解析异常
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# 其余文本用 LF
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+
+# 二进制
+*.exe  binary
+*.ico  binary
+*.png  binary
