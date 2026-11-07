@@ -5,11 +5,37 @@
 param(
     [string]$Text,
     [switch]$Show,
+    [switch]$SmokeTest,
     [string]$Profile = (Join-Path $env:USERPROFILE '.dsh\profiles\yunban\cordis.patch.yml')
 )
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# ---------- UI 诊断日志 ----------
+# 「点了没反应」最难查的地方是错误被吞掉、状态没人记录。
+# 这里把窗口是否真的显示出来、启动参数、Shown 事件的异常都写进 data\logs\persona-ui.log。
+$uiLogFile = Join-Path $here 'data\logs\persona-ui.log'
+function Write-UiLog([string]$m) {
+    try {
+        $dir = Split-Path $uiLogFile -Parent
+        if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::AppendAllText($uiLogFile,
+            ("[{0}] {1}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m))
+    } catch { }
+}
+
+# 未捕获异常不再静默消失：先记日志，能弹窗就弹一个
+trap {
+    $msg = [string]$_.Exception.Message
+    Write-UiLog ("未捕获异常：" + $msg + " @ " + $_.InvocationInfo.ScriptLineNumber)
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        [System.Windows.Forms.MessageBox]::Show(
+            "人格设置出错：`n`n$msg`n`n详情已写入：`n$uiLogFile", '出错了', 'OK', 'Error') | Out-Null
+    } catch { }
+    exit 1
+}
 
 # 清空会话记忆：旧人格会通过历史对话把人设拽回去，所以换人格必须一起清
 function Clear-Sessions {
@@ -330,6 +356,7 @@ if ($PSBoundParameters.ContainsKey('Text')) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+Write-UiLog ("界面启动 pid=$PID 参数=[" + (($PSBoundParameters.Keys | ForEach-Object { "$_=$($PSBoundParameters[$_])" }) -join ' ') + "]")
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'AI 人格设置 · 云班桥接器'
@@ -440,4 +467,55 @@ $btnOk.Add_Click({
 })
 
 $updateCount.Invoke()
+
+# ── 保证窗体一定可见 ──
+# 从托盘/快捷方式启动时，进程可能带着 SW_HIDE 标志（-WindowStyle Hidden）。
+# Windows 只让进程的**第一次** ShowWindow 遵循这个标志，通常会被 WinForms 的窗体吃掉，
+# 结果窗口"显示"成了隐藏状态：进程活着、ShowDialog 一直阻塞、界面永远看不见。
+# 这里主动把这一次 ShowWindow 消耗在控制台上（顺便把黑窗藏掉），窗体随后就能正常显示。
+try {
+    if (-not ('Yb.Win32' -as [type])) {
+        Add-Type -Namespace 'Yb' -Name 'Win32' -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+'@
+    }
+    $hConsole = [Yb.Win32]::GetConsoleWindow()
+    if ($hConsole -ne [IntPtr]::Zero) { [void][Yb.Win32]::ShowWindow($hConsole, 0) }   # 0 = SW_HIDE
+} catch { }
+
+$form.Add_Shown({
+    try {
+        [void][Yb.Win32]::SetForegroundWindow($form.Handle)
+        $form.Activate()
+
+        # 兜底：万一还是被 SW_HIDE 之类的外部状态压成不可见，这里强制显示一次
+        if (-not $form.Visible) {
+            [void][Yb.Win32]::ShowWindow($form.Handle, 5)   # 5 = SW_SHOW
+            $form.Visible = $true
+            $form.Activate()
+        }
+        Write-UiLog ("窗体已显示 handle=$($form.Handle) visible=$($form.Visible) 字数=$($box.Text.Length)")
+    } catch {
+        Write-UiLog ("Shown 事件异常：" + $_.Exception.Message)
+    }
+})
+
+# 冒烟测试：只验证"界面能构建、控件与事件都在"，不弹窗、不需要人点
+if ($SmokeTest) {
+    $info = [pscustomobject]@{
+        标题         = $form.Text
+        控件数       = $form.Controls.Count
+        按钮         = @($btnOk, $btnDefault, $btnCancel).Count
+        文本框字数   = $box.Text.Length
+        保存已绑定   = ($btnOk.GetType().Name -eq 'Button')
+        默认已绑定   = ($btnDefault.GetType().Name -eq 'Button')
+        人格段存在   = ($box.Text.Length -gt 0)
+    }
+    Write-Host ('SMOKE ' + ($info | ConvertTo-Json -Compress))
+    $form.Dispose()
+    exit 0
+}
+
 [void]$form.ShowDialog()

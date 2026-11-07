@@ -415,13 +415,38 @@ $itemRebind.Add_Click({
 
 $itemPersona = $menu.Items.Add('更换 AI 人格…')
 $itemPersona.Add_Click({
-    $s = Join-Path $root '人格设置.ps1'
-    if (Test-Path $s) {
-        Start-Process -FilePath 'powershell.exe' `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $s) `
-            -WindowStyle Hidden
-    } else {
-        Show-Balloon '找不到人格设置脚本' $s
+    try {
+        $s = Join-Path $root '人格设置.ps1'
+        if (!(Test-Path $s)) {
+            Show-Balloon '找不到人格设置脚本' $s
+            return
+        }
+
+        # 已经开着就直接切过去，不要每点一次多一个进程
+        $opened = @(Get-Process -Name 'powershell' -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowTitle -like '*人格设置*' })
+        if ($opened.Count -gt 0) {
+            try {
+                (New-Object -ComObject WScript.Shell).AppActivate($opened[0].Id) | Out-Null
+            } catch { }
+            Show-Balloon '人格设置已经开着' '已帮你切到那个窗口'
+            return
+        }
+
+        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (!(Test-Path $psExe)) { $psExe = 'powershell.exe' }
+
+        # 注意：这里**不能**加 -WindowStyle Hidden。
+        # 那会把进程的 STARTUPINFO 设成 SW_HIDE，而 Windows 只让进程的第一次 ShowWindow
+        # 遵循这个标志 —— 正好被 WinForms 的窗体吃掉，结果窗口"显示"成隐藏状态：
+        # 进程活着、ShowDialog 一直阻塞、界面永远看不见（以前点了没反应就是这个原因）。
+        Start-Process -FilePath $psExe `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $s + '"')) `
+            -WorkingDirectory $root | Out-Null
+
+        Show-Balloon '已打开人格设置' '改完点「保存并应用」，会当场核验是否真的生效'
+    } catch {
+        Show-Balloon '打开人格设置失败' ([string]$_.Exception.Message)
     }
 })
 
