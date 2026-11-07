@@ -7,7 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-chcp 65001 > $null
+try { chcp 65001 > $null } catch { }   # 精简 PATH 的环境里可能没有 chcp，不影响打包
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 function Step($m) { Write-Host "[build] $m" -ForegroundColor Cyan }
