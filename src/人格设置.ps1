@@ -13,10 +13,9 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # 清空会话记忆：旧人格会通过历史对话把人设拽回去，所以换人格必须一起清
 function Clear-Sessions {
-    $targets = @(
-        (Join-Path $here 'data\session_map.json'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\YunbanBridge\data\session_map.json')
-    )
+    $targets = New-Object System.Collections.Generic.List[string]
+    $targets.Add((Join-Path $here 'data\session_map.json'))
+    if ($env:LOCALAPPDATA) { $targets.Add((Join-Path $env:LOCALAPPDATA 'Programs\YunbanBridge\data\session_map.json')) }
     $cleared = 0
     foreach ($t in $targets) {
         if (Test-Path $t) {
@@ -37,10 +36,9 @@ function Test-TrayRunning {
 }
 
 function Restart-BridgeIfRunning {
-    $locks = @(
-        (Join-Path $here 'data\bridge.lock'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\YunbanBridge\data\bridge.lock')
-    )
+    $locks = New-Object System.Collections.Generic.List[string]
+    $locks.Add((Join-Path $here 'data\bridge.lock'))
+    if ($env:LOCALAPPDATA) { $locks.Add((Join-Path $env:LOCALAPPDATA 'Programs\YunbanBridge\data\bridge.lock')) }
     $hasTray = Test-TrayRunning
     $stopped = 0
     foreach ($l in $locks) {
@@ -61,6 +59,83 @@ function Format-RestartTip($rs) {
     if ($rs.Stopped -gt 0) { return '已重启桥接（托盘会在几秒内自动拉起）。' }
     if ($rs.Tray) { return '桥接当前没在跑，托盘会按需拉起。' }
     return '桥接当前没在跑；下次启动就会用新人格。'
+}
+
+# ---------- DSH 侧：核验「配置是否真的被读进去」+ 处理桌面端缓存 ----------
+# 背景（2026-11-07 修复）：
+#   ① 之前只把文本写进 YAML 就弹「成功」，但写进去的可能是垃圾（比如拖进来的一行快捷方式路径），
+#      照样提示成功 —— 新会话自然"没有人格"。现在写入后会用 DSH 自己的 --dump-config 实机核对。
+#   ② DSH 桌面端在**启动时**把 profile 读进内存（hmr 关闭，不热更），改完人格必须让它重启，
+#      否则在那个窗口里新建的会话仍然是旧人格/没有新人格。
+
+function Get-DshInstall {
+    $cands = New-Object System.Collections.Generic.List[string]
+    if ($env:DSH_APP_DIR) { $cands.Add($env:DSH_APP_DIR) }
+    if ($env:LOCALAPPDATA) {
+        $cands.Add((Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness'))
+        $cands.Add((Join-Path $env:LOCALAPPDATA 'DeepSeekHarness'))
+    }
+    $cands.Add('C:\Program Files\DeepSeek Harness')
+    $cands.Add('D:\DeepSeekHarness')
+    foreach ($d in $cands) {
+        if (!$d) { continue }
+        $exe = Join-Path $d 'app\DeepSeek Harness.exe'
+        if (Test-Path $exe) { return @{ Dir = $d; Exe = $exe } }
+    }
+    return $null
+}
+
+function Get-NodeExe {
+    $c = New-Object System.Collections.Generic.List[string]
+    if ($env:ProgramFiles) { $c.Add((Join-Path $env:ProgramFiles 'nodejs\node.exe')) }
+    if ($env:LOCALAPPDATA) { $c.Add((Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe')) }
+    $c.Add('C:\Program Files\nodejs\node.exe')
+    foreach ($p in $c) { if ($p -and (Test-Path $p)) { return $p } }
+    try { $cmd = Get-Command node -ErrorAction Stop; return $cmd.Source } catch { }
+    return $null
+}
+
+# 让 DSH 自己把 profile 合成一遍，取它真正拿到的 personaPrefix。
+# 实现放在 tools/verify_persona.js：Electron 的 --dump-config 输出直接写控制台，
+# PowerShell 的管道/重定向抓不全，交给 Node 的 execFile 更稳。
+function Get-DshRuntimePersona([string]$profileName) {
+    if (!(Get-DshInstall)) { return $null }
+    $node = Get-NodeExe
+    $js = Join-Path $here 'tools\verify_persona.js'
+    if (!$node -or !(Test-Path $js)) { return $null }
+
+    # 结果写文件再读：不依赖子进程 stdout 捕获（不同宿主下 stdout 可能接不住）
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('ybp_' + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+        $null = & $node $js $profileName ('--out=' + $tmp) 2>$null
+    } catch {
+        return $null
+    }
+
+    # DSH 合成一次配置要 1~3 秒；某些宿主下子进程还是异步的，这里轮询等结果落地
+    for ($i = 0; $i -lt 60; $i++) {
+        if ((Test-Path $tmp) -and ((Get-Item $tmp -ErrorAction SilentlyContinue).Length -gt 0)) { break }
+        Start-Sleep -Milliseconds 250
+    }
+
+    $line = $null
+    if (Test-Path $tmp) {
+        $line = (Get-Content -LiteralPath $tmp -Raw -Encoding UTF8)
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+    if (!$line) { return $null }
+    try { $o = $line | ConvertFrom-Json } catch { return $null }
+    if (!$o.ok) { return $null }
+    return [string]$o.persona
+}
+
+function Normalize-Persona([string]$s) {
+    if ($null -eq $s) { return '' }
+    return (($s -replace "`r`n", "`n" -replace "`r", "`n").Trim())
+}
+
+function Test-DshDesktopRunning {
+    return [bool](Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue)
 }
 
 # ---------- 读取当前人格 ----------
@@ -153,6 +228,18 @@ function Test-PersonaText([string]$t) {
     if ($t.Length -gt 4000) {
         return @{ Ok = $false; Msg = "内容太长（$($t.Length) 字）。上限 4000 字，请精简后再保存。已保留原设定。" }
     }
+
+    # 误操作拦截：把快捷方式/文件拖进来、或在资源管理器里复制文件后粘贴，
+    # 文本框里就是一行路径。以前这种也能存进去并提示"成功"，但新会话等于没有人格。
+    $nonEmpty = @($t -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+    $looksPath = ($nonEmpty.Count -le 2) -and (
+        ($t.Trim() -match '^[A-Za-z]:\\') -or
+        ($t.Trim() -match '^\\\\') -or
+        ($t.Trim() -match '\.(lnk|exe|url|bat|cmd|ps1)$')
+    )
+    if ($looksPath) {
+        return @{ Ok = $false; Msg = "这看起来是一个文件路径，不是人格设定：`n`n$($t.Trim())`n`n人格应该是描述 AI 身份与说话方式的一段文字。已保留原设定，没有做任何修改。" }
+    }
     return @{ Ok = $true; Msg = '' }
 }
 
@@ -179,6 +266,47 @@ $DefaultPersona = @'
 - 不描述、不假装执行任何命令行或系统操作。
 '@
 
+# ---------- 统一的应用流程（校验 → 写入 → 实机核验 → 清会话 → 重启桥接） ----------
+function Get-Preview([string]$s, [int]$n = 60) {
+    $one = (Normalize-Persona $s) -replace "`n", ' '
+    if ($one.Length -le $n) { return $one }
+    return $one.Substring(0, $n) + '…'
+}
+
+function Apply-Persona([string]$file, [string]$text) {
+    $v = Test-PersonaText $text
+    if (-not $v.Ok) { return [pscustomobject]@{ Ok = $false; Msg = $v.Msg } }
+
+    $bak = Set-Persona $file $text
+
+    # 实机核验：让 DSH 自己把 profile 合成一遍，确认它读到的就是这段文本。
+    # 这一步把"提示成功"和"真的注入"绑在一起：读不到就回滚并报错。
+    $profileName = Split-Path (Split-Path $file -Parent) -Leaf
+    $runtime = Get-DshRuntimePersona $profileName
+    if ($null -ne $runtime) {
+        if ((Normalize-Persona $runtime) -ne (Normalize-Persona $text)) {
+            Copy-Item -LiteralPath $bak -Destination $file -Force
+            return [pscustomobject]@{
+                Ok   = $false
+                Msg  = ("已还原原文件：DSH 实际读到的内容与刚保存的不一致。`n`n" +
+                        "DSH 读到：" + (Get-Preview $runtime 80) + "`n`n" +
+                        "常见原因：配置文件被别的程序改过，或当前 DSH 版本不认 personaPrefix 段。")
+            }
+        }
+    }
+
+    $n = Clear-Sessions
+    $rs = Restart-BridgeIfRunning
+    return [pscustomobject]@{
+        Ok       = $true
+        Bak      = $bak
+        Cleared  = $n
+        Restart  = $rs
+        Verified = ($null -ne $runtime)
+        Desktop  = (Test-DshDesktopRunning)
+    }
+}
+
 # ---------- 命令行模式（测试用） ----------
 if ($Show) {
     $p = Get-Persona $Profile
@@ -188,12 +316,13 @@ if ($Show) {
 }
 
 if ($PSBoundParameters.ContainsKey('Text')) {
-    $v = Test-PersonaText $Text
-    if (-not $v.Ok) { Write-Host "[拒绝] $($v.Msg)"; exit 2 }
-    $bak = Set-Persona $Profile $Text
-    $n = Clear-Sessions
-    $rs = Restart-BridgeIfRunning
-    Write-Host "[完成] 已应用新人格（备份：$(Split-Path -Leaf $bak)，清空会话记忆 $n 处）$(Format-RestartTip $rs)"
+    $r = Apply-Persona $Profile $Text
+    if (-not $r.Ok) { Write-Host "[拒绝] $($r.Msg)"; exit 2 }
+    $mk = if ($r.Verified) { '已核验：DSH 读到的就是这段文本' } else { '未核验（找不到 DSH 安装，仅写入文件）' }
+    Write-Host "[完成] 已应用新人格（$mk；备份：$(Split-Path -Leaf $r.Bak)，清空会话记忆 $($r.Cleared) 处）$(Format-RestartTip $r.Restart)"
+    if ($r.Desktop) {
+        Write-Host '[注意] DSH 桌面端正在运行：它只在启动时读配置，请关闭后重新打开，新会话才会用新人格。'
+    }
     exit 0
 }
 
@@ -223,7 +352,7 @@ $lblTitle.AutoSize = $true
 $form.Controls.Add($lblTitle)
 
 $lblHint = New-Object System.Windows.Forms.Label
-$lblHint.Text = '保存后立即生效（下一次回复就用新人格）。为避免旧对话把人设拽回去，保存时会清空会话记忆。'
+$lblHint.Text = '保存后会做两件事：写入后让 DSH 实机核验一遍（读不到就回滚并报错），清空桥接的会话记忆。注意：DSH 桌面端只在启动时读配置，若它正开着，需要重启它新会话才会用新人格。'
 $lblHint.ForeColor = [System.Drawing.Color]::FromArgb(90, 90, 90)
 $lblHint.Location = New-Object System.Drawing.Point(22, 48)
 $lblHint.Size = New-Object System.Drawing.Size(600, 34)
@@ -276,18 +405,34 @@ $form.AcceptButton = $null
 $btnDefault.Add_Click({ $box.Text = $DefaultPersona })
 
 $btnOk.Add_Click({
-    $v = Test-PersonaText $box.Text
-    if (-not $v.Ok) {
-        [System.Windows.Forms.MessageBox]::Show($v.Msg, '无法保存', 'OK', 'Warning') | Out-Null
-        return
-    }
     try {
-        $bak = Set-Persona $Profile $box.Text
-        $n = Clear-Sessions
-        $rs = Restart-BridgeIfRunning
-        [System.Windows.Forms.MessageBox]::Show(
-            "已应用新人格，下一次回复就会用它。`n`n原配置已备份为：$(Split-Path -Leaf $bak)`n清空会话记忆 $n 处。`n$(Format-RestartTip $rs)",
-            '保存成功', 'OK', 'Information') | Out-Null
+        $r = Apply-Persona $Profile $box.Text
+        if (-not $r.Ok) {
+            [System.Windows.Forms.MessageBox]::Show($r.Msg, '无法保存', 'OK', 'Warning') | Out-Null
+            return
+        }
+
+        $verifyLine = if ($r.Verified) { '已核验：DSH 读到的就是这段文本 ✅' } else { '未核验（没找到 DSH 安装，只写了文件）⚠' }
+        $msg = "人格已保存。`n`n$verifyLine`n原配置已备份为：$(Split-Path -Leaf $r.Bak)`n清空会话记忆 $($r.Cleared) 处。`n$(Format-RestartTip $r.Restart)"
+
+        # DSH 桌面端在启动时读配置（不热更）：开着就必须重启，否则新会话还是旧人格
+        if ($r.Desktop) {
+            $msg += "`n`n检测到 DSH 桌面端正在运行。`n它只在启动时读取人格配置，所以现在直接在窗口里新建会话，用的还是旧人格。"
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                ($msg + "`n`n要现在关闭 DSH 桌面端吗？（关闭后请手动重新打开，之后的会话都会用新人格）"),
+                '已保存 · 需要重启 DSH', 'YesNo', 'Warning')
+            if ($ans -eq 'Yes') {
+                Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 800
+                $msg += "`n`n已关闭 DSH 桌面端，请重新打开它。"
+            } else {
+                $msg += "`n`n你选择了稍后处理：记得手动重启 DSH 桌面端，否则新会话不会用新人格。"
+            }
+            [System.Windows.Forms.MessageBox]::Show($msg, '保存成功', 'OK', 'Information') | Out-Null
+        } else {
+            [System.Windows.Forms.MessageBox]::Show(($msg + "`n`nDSH 当前没在运行，下次打开就是新人格。"), '保存成功', 'OK', 'Information') | Out-Null
+        }
+
         $form.Close()
     } catch {
         [System.Windows.Forms.MessageBox]::Show("保存失败，已还原原文件。`n`n$($_.Exception.Message)", '出错了', 'OK', 'Error') | Out-Null
