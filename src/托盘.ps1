@@ -55,6 +55,15 @@ $script:loginProc = $null
 $script:stopping = $false
 $script:lastStart = [DateTime]::MinValue
 $script:check = $null          # 自检状态（非空表示正在自检）
+$script:adoptedPid = 0         # 已接管的外部桥接实例 PID（0=无）
+
+function Write-TrayLog([string]$m) {
+    try {
+        if (!(Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        [System.IO.File]::AppendAllText((Join-Path $logDir 'tray.log'),
+            ("[{0}] {1}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m))
+    } catch { }
+}
 
 # ---------- 图标（GDI+ 现画，并存一份 ico 给快捷方式用） ----------
 function New-DotIcon([System.Drawing.Color]$color) {
@@ -191,9 +200,41 @@ foreach ($n in @('http_proxy', 'https_proxy', 'no_proxy', 'all_proxy')) {
     if (Test-Path ("Env:" + $n)) { Remove-Item ("Env:" + $n) -ErrorAction SilentlyContinue }
 }
 
+# ---------- 进程识别：托盘自己的子进程 vs 已经在跑的实例 ----------
+# 桥接是单实例的（data\bridge.lock 里写着持有者 PID）。若它不是「当前这个托盘」启动的
+# （托盘重启过、从 bat 启动过、上次托盘异常退出留下孤儿进程），只看 $script:proc
+# 就会误判成"已停止"——其实它在正常轮询。这里用 lock 文件把"在跑的实例"认出来。
+function Get-BridgeLockPid {
+    $lock = Join-Path $dataDir 'bridge.lock'
+    if (!(Test-Path $lock)) { return 0 }
+    $raw = Get-Content -LiteralPath $lock -Raw -ErrorAction SilentlyContinue
+    $n = 0
+    if ([int]::TryParse(([string]$raw).Trim(), [ref]$n)) { return $n }
+    return 0
+}
+
+function Get-ExternalBridgePid {
+    $id = Get-BridgeLockPid
+    if (!$id) { return 0 }
+    if ($script:proc -and !$script:proc.HasExited -and $script:proc.Id -eq $id) { return 0 }  # 就是自己的孩子
+    $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+    if ($p -and $p.ProcessName -eq 'node') { return $id }
+    return 0
+}
+
+function Get-BridgeStartError {
+    # 子进程秒退时，main.js 会把原因打到 console.err.log（例如锁冲突）
+    $err = Join-Path $logDir 'console.err.log'
+    if (!(Test-Path $err)) { return '' }
+    $line = Get-Content -LiteralPath $err -Tail 1 -Encoding UTF8 -ErrorAction SilentlyContinue
+    return ([string]$line).Trim()
+}
+
 function Start-Bridge {
     if (Test-Disabled) { return }        # 总开关关着，绝不启动
     if ($script:proc -and !$script:proc.HasExited) { return }
+    $ext = Get-ExternalBridgePid
+    if ($ext) { return }                 # 已有实例在跑（不是自己起的），不要重复启动去撞锁
     if (!$script:nodeExe) { Show-Balloon '启动失败' '未找到 Node.js（本程序需要 Node 22+）：https://nodejs.org 安装后重启托盘'; return }
     $script:lastStart = Get-Date
     $out = Join-Path $logDir 'console.out.log'
@@ -209,6 +250,8 @@ function Start-Bridge {
     } catch {
         Show-Balloon '启动失败' ([string]$_.Exception.Message)
     }
+    # 自己起来了，就别再记着"接管别人的实例"
+    if ($script:proc -and !$script:proc.HasExited) { $script:adoptedPid = 0 }
 }
 
 function Stop-Bridge {
@@ -216,7 +259,14 @@ function Stop-Bridge {
         try { Stop-Process -Id $script:proc.Id -Force -ErrorAction SilentlyContinue } catch { }
         Start-Sleep -Milliseconds 600
     }
+    # 不是自己起的实例也要能停掉（否则「停用桥接」对孤儿进程无效）
+    $ext = Get-ExternalBridgePid
+    if ($ext) {
+        try { Stop-Process -Id $ext -Force -ErrorAction SilentlyContinue } catch { }
+        Start-Sleep -Milliseconds 600
+    }
     $script:proc = $null
+    $script:adoptedPid = 0
     # 强杀主程序会留下 DSH 子进程（Electron），它们会占着会话写句柄，
     # 下次提问就成了 "session already owned"。这里按命令行特征精准收掉。
     try {
@@ -504,6 +554,17 @@ function Update-Ui {
     $s = Read-Status
     $alive = ($script:proc -and !$script:proc.HasExited)
 
+    # 桥接是单实例的。如果它正在跑、但不是「本托盘」启动的（托盘重启过、从 bat 启动过、
+    # 上次托盘异常退出留下孤儿进程），只看 $script:proc 会误判成"已停止"。
+    # 这里用 data\bridge.lock 里的 PID 把它认出来，状态显示为"运行中（外部实例）"。
+    $externalPid = if ($alive) { 0 } else { Get-ExternalBridgePid }
+    $running = $alive -or ($externalPid -ne 0)
+    if ($externalPid -ne 0 -and $script:adoptedPid -ne $externalPid) {
+        $script:adoptedPid = $externalPid
+        Write-TrayLog ("接管已在运行的桥接实例 PID=$externalPid（不是本托盘启动的）")
+        Show-Balloon '已接管正在运行的桥接' ("桥接进程 PID $externalPid 原本就在跑（不是本托盘启动的），已直接接管，不会再重启一份")
+    }
+
     # —— 总开关：停用时停掉一切（不自动拉起、不轮询）——
     $itemEnable.Checked = -not (Test-Disabled)
     if (Test-Disabled) {
@@ -517,12 +578,21 @@ function Update-Ui {
 
     # 主程序意外退出 → 自动拉起（8 秒冷却，避免 crash 循环打满 CPU）
     # 正在登录时不自动拉起，否则会和登录进程抢锁；没有登录态时也不拉（起了也是立刻退出）
-    if (!$alive -and !$script:stopping -and !$script:loginProc -and (Test-Path $cookieFile)) {
+    # 注意用 $running 而不是 $alive：外部实例还活着时再拉一份只会撞锁白退
+    if (!$running -and !$script:stopping -and !$script:loginProc -and (Test-Path $cookieFile)) {
         if (((Get-Date) - $script:lastStart).TotalSeconds -ge 8) {
             Start-Bridge
             Start-Sleep -Milliseconds 400
             $alive = ($script:proc -and !$script:proc.HasExited)
+            $externalPid = if ($alive) { 0 } else { Get-ExternalBridgePid }
+            $running = $alive -or ($externalPid -ne 0)
             if ($alive) { Show-Balloon '桥接器已自动重启' '主程序意外退出，已重新拉起' }
+            elseif ($externalPid -ne 0) {
+                # 起不来是因为别人占着锁：把真正原因说出来，别只显示"已停止"
+                $why = Get-BridgeStartError
+                $script:adoptedPid = $externalPid
+                Show-Balloon '桥接已在运行' ("检测到 PID $externalPid 正在跑，已接管；本次启动被单实例锁挡住" + $(if ($why) { "：$why" } else { '' }))
+            }
         }
     }
 
@@ -539,7 +609,7 @@ function Update-Ui {
         return
     }
 
-    if (!$alive) {
+    if (!$running) {
         if (!(Test-Path $cookieFile)) {
             # 全新安装：还没有登录态，主程序起来也会立刻退出，这里直接引导登录
             $script:tray.Icon = $script:icons.orange
@@ -551,7 +621,9 @@ function Update-Ui {
         $script:tray.Icon = $script:icons.gray
         $script:tray.Text = '云班-DSH 桥接器（已停止）'
         $itemStatus.Text = '状态：已停止'
-        $itemSummary.Text = '进程未运行'
+        # 把"为什么停"说出来：真没进程，还是启动被锁挡住
+        $why = Get-BridgeStartError
+        $itemSummary.Text = if ($why) { '进程未运行：' + $why } else { '进程未运行' }
         return
     }
 
@@ -577,6 +649,11 @@ function Update-Ui {
         $script:tray.Icon = $script:icons.green
         $script:tray.Text = '云班-DSH 桥接器（运行中）'
         $itemStatus.Text = '状态：运行中' + $(if ($s.'演练模式') { '（演练模式）' } else { '' })
+    }
+
+    # 明确标出"这不是我起的进程"，避免以后又误判成"已停止"
+    if ($externalPid -ne 0) {
+        $itemStatus.Text = $itemStatus.Text + '（外部实例 PID ' + $externalPid + '）'
     }
 
     $sum = [string]$s.'最后轮询摘要'
